@@ -1,10 +1,7 @@
 #include "kutuzov_i_convex_hull_jarvis/stl/include/ops_stl.hpp"
 
-#include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
-#include <execution>
 #include <thread>
 #include <vector>
 
@@ -14,18 +11,17 @@ namespace kutuzov_i_convex_hull_jarvis {
 
 namespace {
 
-inline unsigned GetThreadIndex() {
-  static std::atomic<unsigned> next_id{0};
-  thread_local unsigned tid = next_id.fetch_add(1, std::memory_order_relaxed) % std::thread::hardware_concurrency();
-  return tid;
-}
-
 struct BestCandidate {
   size_t index;
   double x, y;
 };
 
-}  // namespace
+inline unsigned GetNumThreads() {
+  const unsigned hw = std::thread::hardware_concurrency();
+  return (hw == 0) ? 1 : hw;
+}
+
+}  // anonymous namespace
 
 KutuzovITestConvexHullSTL::KutuzovITestConvexHullSTL(const InType &in) {
   SetTypeOfTask(GetStaticTypeOfTask());
@@ -42,7 +38,7 @@ double KutuzovITestConvexHullSTL::CrossProduct(double o_x, double o_y, double a_
 }
 
 size_t KutuzovITestConvexHullSTL::FindLeftmostPoint(const InType &input) {
-  auto it = std::min_element(std::execution::par, input.begin(), input.end(), [](const auto &a, const auto &b) {
+  auto it = std::min_element(input.begin(), input.end(), [](const auto &a, const auto &b) {
     double ax = std::get<0>(a), ay = std::get<1>(a);
     double bx = std::get<0>(b), by = std::get<1>(b);
     return (ax < bx) || (ax == bx && ay < by);
@@ -64,7 +60,6 @@ bool KutuzovITestConvexHullSTL::IsBetterPoint(double cross, double epsilon, doub
 bool KutuzovITestConvexHullSTL::ValidationImpl() {
   return true;
 }
-
 bool KutuzovITestConvexHullSTL::PreProcessingImpl() {
   return true;
 }
@@ -80,10 +75,11 @@ bool KutuzovITestConvexHullSTL::RunImpl() {
   output.clear();
 
   const double epsilon = 1e-9;
+  const size_t n = points.size();
 
-  size_t leftmost_idx = FindLeftmostPoint(points);
+  const size_t leftmost_idx = FindLeftmostPoint(points);
 
-  const unsigned num_threads = std::thread::hardware_concurrency();
+  const unsigned num_threads = GetNumThreads();
   std::vector<BestCandidate> locals(num_threads);
 
   size_t current_idx = leftmost_idx;
@@ -97,29 +93,45 @@ bool KutuzovITestConvexHullSTL::RunImpl() {
       locals[i] = {current_idx, current_x, current_y};
     }
 
-    std::for_each(std::execution::par, points.begin(), points.end(), [&](const auto &p) {
-      unsigned tid = GetThreadIndex();
-      BestCandidate &best = locals[tid];
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
 
-      size_t idx = &p - points.data();
-      if (idx == current_idx) {
-        return;
+    for (unsigned tid = 0; tid < num_threads; ++tid) {
+      size_t start = (tid * n) / num_threads;
+      size_t end = ((tid + 1) * n) / num_threads;
+      if (start >= end) {
+        continue;
       }
 
-      double px = std::get<0>(p);
-      double py = std::get<1>(p);
+      threads.emplace_back([&, tid, start, end]() {
+        BestCandidate &best = locals[tid];
 
-      double cross = (best.x - current_x) * (py - current_y) - (best.y - current_y) * (px - current_x);
+        for (size_t i = start; i < end; ++i) {
+          if (i == current_idx) {
+            continue;
+          }
 
-      if (cross < -epsilon ||
-          (std::abs(cross) < epsilon &&
-           (px - current_x) * (px - current_x) + (py - current_y) * (py - current_y) >
-               (best.x - current_x) * (best.x - current_x) + (best.y - current_y) * (best.y - current_y))) {
-        best.index = idx;
-        best.x = px;
-        best.y = py;
-      }
-    });
+          const auto &p = points[i];
+          double px = std::get<0>(p);
+          double py = std::get<1>(p);
+
+          double cross = (best.x - current_x) * (py - current_y) - (best.y - current_y) * (px - current_x);
+
+          if (cross < -epsilon ||
+              (std::abs(cross) < epsilon &&
+               (px - current_x) * (px - current_x) + (py - current_y) * (py - current_y) >
+                   (best.x - current_x) * (best.x - current_x) + (best.y - current_y) * (best.y - current_y))) {
+            best.index = i;
+            best.x = px;
+            best.y = py;
+          }
+        }
+      });
+    }
+
+    for (auto &t : threads) {
+      t.join();
+    }
 
     size_t global_idx = locals[0].index;
     double global_x = locals[0].x;
@@ -129,8 +141,10 @@ bool KutuzovITestConvexHullSTL::RunImpl() {
       if (locals[i].index == current_idx) {
         continue;
       }
+
       double cross =
           (global_x - current_x) * (locals[i].y - current_y) - (global_y - current_y) * (locals[i].x - current_x);
+
       if (cross < -epsilon ||
           (std::abs(cross) < epsilon && DistanceSquared(current_x, current_y, locals[i].x, locals[i].y) >
                                             DistanceSquared(current_x, current_y, global_x, global_y))) {
